@@ -55,7 +55,9 @@ const OIDCLoginButton = () => {
     }
 
     const handleClick = () => {
-        const returnTo = new URLSearchParams(window.location.search).get('redirect_to') || '/';
+        const {pathname, search} = window.location;
+        const invitePage = pathname.startsWith('/signup_') ? pathname + search : '/';
+        const returnTo = new URLSearchParams(search).get('redirect_to') || invitePage;
         const base = `${OAUTH2_BASE}/connect?return_to=${encodeURIComponent(returnTo)}`;
 
         if (isDesktopApp(window.navigator.userAgent)) {
@@ -116,81 +118,94 @@ const OIDCLoginButton = () => {
     );
 };
 
-// Plugin registration
+// Fallback injection targets, for Mattermost < 7.8 (login) and pages without a plugin slot (signup).
+const INJECTION_TARGETS = [
+    {
+        id: 'oidc-signup-button-container',
+        paths: ['/signup_user_complete', '/signup_email'],
+        selector: '.signup-body-card-content, .signup-body-content-button-container, .signup-body-card, .signup-team__container, .signup-body, .signup__content',
+    },
+    {
+        id: 'oidc-login-button-container',
+        paths: ['/login'],
+        selector: '.signup-team__container, .login-body-card-content',
+        legacyOnly: true,
+    },
+];
+
+const insertContainer = (target, container) => {
+    const anchor = target.querySelector('.signup-body-card-form-login-options');
+    if (anchor) {
+        anchor.appendChild(container);
+        return;
+    }
+    const form = target.querySelector('form');
+    if (form) {
+        form.parentNode.insertBefore(container, form);
+        return;
+    }
+    target.prepend(container);
+};
+
 class PluginClass {
     initialize(registry) {
-        // Register the login button component on the custom login buttons slot.
-        // This hook is available in Mattermost v7.8+ (webapp plugin API).
-        if (registry.registerCustomLoginButtonComponent) {
+        const hasLoginSlot = Boolean(registry.registerCustomLoginButtonComponent);
+        if (hasLoginSlot) {
             registry.registerCustomLoginButtonComponent(OIDCLoginButton);
-        } else {
-            // Fallback: inject the button into the login page via DOM manipulation
-            this.injectLoginButton();
         }
+
+        this.roots = new Map();
+        this.targets = INJECTION_TARGETS.filter((t) => !(t.legacyOnly && hasLoginSlot));
+
+        // Mattermost is a SPA: these pages can mount at any time after initialize.
+        this.observer = new MutationObserver(() => this.injectButton());
+        this.observer.observe(document.body, {childList: true, subtree: true});
+        this.injectButton();
     }
 
-    injectLoginButton() {
-        // Observe DOM changes to inject the button when the login page renders.
-        // Restrict to the login page: the `.signup-team__container` selector also
-        // matches the "select team" screen (/select_team), which is shown *after*
-        // a successful login, so it must not be used as an injection target there.
-        this.observer = new MutationObserver(() => {
-            if (!window.location.pathname.startsWith('/login')) {
-                return;
-            }
-            const loginForm = document.querySelector('.signup-team__container, .login-body-card-content');
-            if (loginForm && !document.getElementById('oidc-login-button-container')) {
-                const container = document.createElement('div');
-                container.id = 'oidc-login-button-container';
-                container.style.marginBottom = '16px';
+    injectButton() {
+        const {pathname} = window.location;
+        const page = this.targets.find((t) => t.paths.some((p) => pathname.startsWith(p)));
+        if (!page || document.getElementById(page.id)) {
+            return;
+        }
+        const target = document.querySelector(page.selector);
+        const {React: ReactLib, ReactDOM} = window;
+        if (!target || !ReactLib || !ReactDOM) {
+            return;
+        }
 
-                // Insert before the form
-                const form = loginForm.querySelector('form');
-                if (form) {
-                    form.parentNode.insertBefore(container, form);
-                } else {
-                    loginForm.prepend(container);
-                }
+        const container = document.createElement('div');
+        container.id = page.id;
+        container.style.width = '100%';
+        insertContainer(target, container);
 
-                // Render React component (React/ReactDOM are provided as globals by Mattermost)
-                const ReactLib = window.React;
-                const ReactDOM = window.ReactDOM;
-                if (!ReactLib || !ReactDOM) {
-                    console.warn('OIDC plugin: React/ReactDOM globals not available');
-                    return;
-                }
-                if (ReactDOM.createRoot) {
-                    this.reactRoot = ReactDOM.createRoot(container);
-                    this.reactRoot.render(ReactLib.createElement(OIDCLoginButton));
-                } else {
-                    ReactDOM.render(ReactLib.createElement(OIDCLoginButton), container);
-                }
-
-                // Button injected — stop observing
-                this.observer.disconnect();
-            }
-        });
-
-        this.observer.observe(document.body, {childList: true, subtree: true});
+        const button = ReactLib.createElement(OIDCLoginButton);
+        if (ReactDOM.createRoot) {
+            const root = ReactDOM.createRoot(container);
+            root.render(button);
+            this.roots.set(page.id, root);
+        } else {
+            ReactDOM.render(button, container);
+        }
     }
 
     uninitialize() {
-        if (this.observer) {
-            this.observer.disconnect();
-            this.observer = null;
-        }
-        const container = document.getElementById('oidc-login-button-container');
-        if (container) {
-            if (this.reactRoot) {
-                this.reactRoot.unmount();
-                this.reactRoot = null;
-            } else if (window.ReactDOM && window.ReactDOM.unmountComponentAtNode) {
+        this.observer.disconnect();
+        INJECTION_TARGETS.forEach(({id}) => {
+            const container = document.getElementById(id);
+            if (!container) {
+                return;
+            }
+            if (this.roots.has(id)) {
+                this.roots.get(id).unmount();
+            } else {
                 window.ReactDOM.unmountComponentAtNode(container);
             }
             container.remove();
-        }
+        });
+        this.roots.clear();
     }
 }
 
-// Register the plugin
 window.registerPlugin(PLUGIN_ID, new PluginClass());

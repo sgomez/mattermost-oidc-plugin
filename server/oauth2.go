@@ -362,6 +362,10 @@ func (p *Plugin) handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if joinedTeam := p.handleTeamInvite(state.ReturnTo, mmUser); joinedTeam != "" {
+		state.ReturnTo = "/" + joinedTeam
+	}
+
 	// No session here; the app redeems the code with its verifier.
 	if isDesktop {
 		p.issueDesktopCode(w, &state, mmUser)
@@ -911,4 +915,69 @@ func safeReturnTo(path string) string {
 		return "/"
 	}
 	return path
+}
+
+// Email invitations (?d=…&t=…) are ignored: only core can verify their token.
+func extractInviteID(returnTo string) string {
+	u, err := url.Parse(returnTo)
+	if err != nil || !strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/signup_user_complete") {
+		return ""
+	}
+	return u.Query().Get("id")
+}
+
+// teamEmailAllowed mirrors core's team AllowedDomains check.
+func teamEmailAllowed(team *model.Team, email string) bool {
+	domains := strings.Fields(strings.ToLower(strings.NewReplacer("@", " ", ",", " ").Replace(team.AllowedDomains)))
+	if len(domains) == 0 {
+		return true
+	}
+	email = strings.ToLower(email)
+	for _, d := range domains {
+		if strings.HasSuffix(email, "@"+d) {
+			return true
+		}
+	}
+	return false
+}
+
+func findActiveTeamByInviteID(teams []*model.Team, inviteID string) *model.Team {
+	for _, t := range teams {
+		if t.InviteId == inviteID && t.DeleteAt == 0 {
+			return t
+		}
+	}
+	return nil
+}
+
+func (p *Plugin) handleTeamInvite(returnTo string, user *model.User) string {
+	inviteID := extractInviteID(returnTo)
+	if inviteID == "" {
+		return ""
+	}
+
+	teams, appErr := p.API.GetTeams()
+	if appErr != nil {
+		p.API.LogError("Failed to get teams to resolve invite", "error", appErr.Error())
+		return ""
+	}
+	team := findActiveTeamByInviteID(teams, inviteID)
+	if team == nil {
+		p.API.LogWarn("No team found for invite ID")
+		return ""
+	}
+	if team.IsGroupConstrained() || !teamEmailAllowed(team, user.Email) {
+		p.API.LogWarn("User not allowed to join invited team", "user_id", user.Id, "team_id", team.Id)
+		return ""
+	}
+
+	if member, err := p.API.GetTeamMember(team.Id, user.Id); err == nil && member.DeleteAt == 0 {
+		return team.Name
+	}
+	if _, err := p.API.CreateTeamMember(team.Id, user.Id); err != nil {
+		p.API.LogError("Failed to add user to invited team", "user_id", user.Id, "team_id", team.Id, "error", err.Error())
+		return ""
+	}
+	p.API.LogInfo("Added user to team via invitation", "user_id", user.Id, "team_id", team.Id)
+	return team.Name
 }

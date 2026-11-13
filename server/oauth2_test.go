@@ -977,3 +977,109 @@ func TestOnActivateAndConfigChangeDoNotRedundantlyInitProvider(t *testing.T) {
 		t.Fatalf("discovery hits after changed OnConfigurationChange = %d, want 2", got)
 	}
 }
+
+func TestExtractInviteID(t *testing.T) {
+	tests := []struct {
+		name     string
+		returnTo string
+		want     string
+	}{
+		{"empty", "", ""},
+		{"no invite", "/team/channels/town-square", ""},
+		{"signup invite", "/signup_user_complete/?id=invite123", "invite123"},
+		{"signup invite under subpath", "/chat/signup_user_complete?id=invite123", "invite123"},
+		{"id on other path", "/team/pl/x?id=invite123", ""},
+		{"nested redirect_to", "/login?redirect_to=%2Fsignup_user_complete%2F%3Fid%3Dx", ""},
+		{"email invite payload", "/signup_user_complete/?d=eyJ0ZWFtX2lkIjoidDEifQ&t=token", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractInviteID(tt.returnTo); got != tt.want {
+				t.Errorf("extractInviteID(%q) = %q, want %q", tt.returnTo, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTeamEmailAllowed(t *testing.T) {
+	tests := []struct {
+		domains, email string
+		want           bool
+	}{
+		{"", "a@any.org", true},
+		{"example.com", "a@Example.com", true},
+		{"@foo.org, example.com", "a@example.com", true},
+		{"example.com", "a@evil-example.com", false},
+		{"example.com", "a@example.com.evil", false},
+	}
+	for _, tt := range tests {
+		if got := teamEmailAllowed(&model.Team{AllowedDomains: tt.domains}, tt.email); got != tt.want {
+			t.Errorf("teamEmailAllowed(%q, %q) = %v, want %v", tt.domains, tt.email, got, tt.want)
+		}
+	}
+}
+
+func TestHandleTeamInvite(t *testing.T) {
+	groupConstrained := true
+	teams := []*model.Team{
+		{Id: "team-open", Name: "open", InviteId: "invite-open"},
+		{Id: "team-archived", Name: "archived", InviteId: "invite-archived", DeleteAt: 1},
+		{Id: "team-domain", Name: "domain", InviteId: "invite-domain", AllowedDomains: "corp.com"},
+		{Id: "team-group", Name: "group", InviteId: "invite-group", GroupConstrained: &groupConstrained},
+	}
+	user := &model.User{Id: "user-1", Email: "u@example.com"}
+	notMember := model.NewAppError("GetTeamMember", "not found", nil, "", http.StatusNotFound)
+
+	newPlugin := func() (*Plugin, *plugintest.API) {
+		api := &plugintest.API{}
+		api.On("GetTeams").Return(teams, nil).Maybe()
+		p := &Plugin{}
+		p.SetAPI(quietAPI{api})
+		return p, api
+	}
+
+	t.Run("joins team by invite ID", func(t *testing.T) {
+		p, api := newPlugin()
+		api.On("GetTeamMember", "team-open", "user-1").Return(nil, notMember)
+		api.On("CreateTeamMember", "team-open", "user-1").Return(&model.TeamMember{}, nil)
+		if got := p.handleTeamInvite("/signup_user_complete/?id=invite-open", user); got != "open" {
+			t.Fatalf("got %q, want %q", got, "open")
+		}
+		api.AssertExpectations(t)
+	})
+
+	t.Run("existing member is not re-added", func(t *testing.T) {
+		p, api := newPlugin()
+		api.On("GetTeamMember", "team-open", "user-1").Return(&model.TeamMember{}, nil)
+		if got := p.handleTeamInvite("/signup_user_complete/?id=invite-open", user); got != "open" {
+			t.Fatalf("got %q, want %q", got, "open")
+		}
+		api.AssertNotCalled(t, "CreateTeamMember", mock.Anything, mock.Anything)
+	})
+
+	t.Run("former member rejoins", func(t *testing.T) {
+		p, api := newPlugin()
+		api.On("GetTeamMember", "team-open", "user-1").Return(&model.TeamMember{DeleteAt: 1}, nil)
+		api.On("CreateTeamMember", "team-open", "user-1").Return(&model.TeamMember{}, nil)
+		if got := p.handleTeamInvite("/signup_user_complete/?id=invite-open", user); got != "open" {
+			t.Fatalf("got %q, want %q", got, "open")
+		}
+		api.AssertExpectations(t)
+	})
+
+	for _, tc := range []struct{ name, returnTo string }{
+		{"team ID is not an invite", "/signup_user_complete/?id=team-open"},
+		{"team name is not an invite", "/signup_user_complete/?id=open"},
+		{"archived team", "/signup_user_complete/?id=invite-archived"},
+		{"email domain not allowed", "/signup_user_complete/?id=invite-domain"},
+		{"group-constrained team", "/signup_user_complete/?id=invite-group"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, api := newPlugin()
+			if got := p.handleTeamInvite(tc.returnTo, user); got != "" {
+				t.Fatalf("got %q, want no team", got)
+			}
+			api.AssertNotCalled(t, "CreateTeamMember", mock.Anything, mock.Anything)
+		})
+	}
+}
